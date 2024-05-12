@@ -796,13 +796,18 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration},
                                  iteration)
+        # datetime
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        # iteration
         log_string += ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
+        # consumed samples
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
+        # elapsed time per iteration
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        # throughput per GPU
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if args.log_timers_to_tensorboard:
@@ -810,15 +815,16 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
-        assert learning_rate is not None
-        # Decoupled_learning_rate should be not None only on first and last pipeline stage.
-        log_string += ' learning rate: {:.6E} |'.format(learning_rate)
-        if args.decoupled_lr is not None and (mpu.is_pipeline_first_stage(ignore_virtual=True) or
-                                              mpu.is_pipeline_last_stage(ignore_virtual=True)):
-            assert decoupled_learning_rate is not None
-            log_string += ' decoupled learning rate: {:.6E} |'.format(decoupled_learning_rate)
-        else:
-            assert decoupled_learning_rate is None
+        # learning rate
+        # assert learning_rate is not None
+        # # Decoupled_learning_rate should be not None only on first and last pipeline stage.
+        # log_string += ' learning rate: {:.6E} |'.format(learning_rate)
+        # if args.decoupled_lr is not None and (mpu.is_pipeline_first_stage(ignore_virtual=True) or
+        #                                       mpu.is_pipeline_last_stage(ignore_virtual=True)):
+        #     assert decoupled_learning_rate is not None
+        #     log_string += ' decoupled learning rate: {:.6E} |'.format(decoupled_learning_rate)
+        # else:
+        #     assert decoupled_learning_rate is None
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
@@ -828,17 +834,20 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
-        log_string += ' loss scale: {:.1f} |'.format(loss_scale)
+        # loss scale
+        # log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
         if num_zeros_in_grad is not None:
             log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
         if params_norm is not None:
             log_string += ' params norm: {:.3f} |'.format(params_norm)
-        log_string += ' number of skipped iterations: {:3d} |'.format(
-            total_loss_dict[skipped_iters_key])
-        log_string += ' number of nan iterations: {:3d} |'.format(
-            total_loss_dict[nan_iters_key])
+        # number of skipped iterations
+        # log_string += ' number of skipped iterations: {:3d} |'.format(
+        #     total_loss_dict[skipped_iters_key])
+        # number of nan iterations
+        # log_string += ' number of nan iterations: {:3d} |'.format(
+        #     total_loss_dict[nan_iters_key])
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
