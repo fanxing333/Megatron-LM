@@ -249,3 +249,7 @@ if __name__ == "__main__":
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
+
+    rank = torch.distributed.get_rank()
+    print(f"[rank {rank}] Max Memory Allocated: {torch.cuda.max_memory_allocated() / 1024 / 1024:.3f} MB")
+    print(f"[rank {rank}] Max Memory Reserved: {torch.cuda.max_memory_reserved() / 1024 / 1024:.3f} MB")

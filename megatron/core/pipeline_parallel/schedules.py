@@ -12,6 +12,8 @@ from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
 
+import nvtx
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -161,6 +163,7 @@ def set_current_microbatch(model, microbatch_id):
         decoder.current_microbatch = microbatch_id
 
 
+@nvtx.annotate(message="forward step", color="green", domain="Pipeline")
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -255,6 +258,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
+@nvtx.annotate(message="backward step", color="red", domain="Pipeline")
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
@@ -1070,6 +1074,7 @@ def get_tensor_shapes(
     return tensor_shapes
 
 
+@nvtx.annotate(message=" recv forward", color="white", domain="Pipeline")
 def recv_forward(tensor_shapes, config):
     input_tensors = []
     for tensor_shape in tensor_shapes:
@@ -1080,6 +1085,7 @@ def recv_forward(tensor_shapes, config):
     return input_tensors
 
 
+@nvtx.annotate(message=" recv backward", color="white", domain="Pipeline")
 def recv_backward(tensor_shapes, config):
     output_tensor_grads = []
     for tensor_shape in tensor_shapes:
@@ -1090,6 +1096,7 @@ def recv_backward(tensor_shapes, config):
     return output_tensor_grads
 
 
+@nvtx.annotate(message=" send forward", color="white", domain="Pipeline")
 def send_forward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
@@ -1099,6 +1106,7 @@ def send_forward(output_tensors, tensor_shapes, config):
         p2p_communication.send_forward(output_tensor, config)
 
 
+@nvtx.annotate(message=" send backward", color="white", domain="Pipeline")
 def send_backward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
@@ -1108,6 +1116,7 @@ def send_backward(input_tensor_grads, tensor_shapes, config):
         p2p_communication.send_backward(input_tensor_grad, config)
 
 
+@nvtx.annotate(message=" send forward recv backward", color="white", domain="Pipeline")
 def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
@@ -1123,6 +1132,7 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     return output_tensor_grads
 
 
+@nvtx.annotate(message=" send backward recv forward", color="white", domain="Pipeline")
 def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
