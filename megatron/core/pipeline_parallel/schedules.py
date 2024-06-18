@@ -12,6 +12,7 @@ from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
 
+import nvtx
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -161,6 +162,7 @@ def set_current_microbatch(model, microbatch_id):
         decoder.current_microbatch = microbatch_id
 
 
+@nvtx.annotate(message="forward step", color="green", domain=f"Pipeline")
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -203,6 +205,29 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
+            # the forward step which should be packed
+            # rank = parallel_state.get_pipeline_model_parallel_rank()
+            # offload_ctx = print_activation(micro_batch_id=current_microbatch,
+            #                        rank=rank) if (model.training and offload_open and current_microbatch==0) else contextlib.nullcontext()
+            
+            # with offload_ctx:
+            #     output_tensor, loss_func = forward_step_func(data_iterator, model)
+            #     # if current_microbatch == 0:
+            #     #     global activation_memory
+            #     #     print(f"junhan > Last one[Rank {rank}] Tensor size: {activation_memory / 1024 / 1024} MB")
+            #     if rank==0 and current_microbatch==1:
+            #         print("junhan > start offloading")
+            #         offloading_stream = torch.cuda.Stream()
+            #         with torch.cuda.stream(offloading_stream):
+            #             global activation_list
+            #             global activation_list_cpu
+            #             for id, tensor in enumerate(activation_list[0]):
+            #                 if tensor is not None:
+            #                     # tensor.to(device="cpu", non_blocking=True) # 2GB/s
+            #                     activation_list_cpu[0][id].copy_(tensor, non_blocking=True)
+            #             print("junhan > end offloading")
+
+            # if you want to get back to normal, just uncomment below and comment above code in this func.
             output_tensor, loss_func = forward_step_func(data_iterator, model)
         else:
             output_tensor, loss_func = forward_step_func(
@@ -255,6 +280,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
+@nvtx.annotate(message="backward step", color="red", domain=f"Pipeline")
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
@@ -288,6 +314,9 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # Backward pass.
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
+
+    # print(f"backward -> \n{output_tensor[0]=} \n{output_tensor_grad[0]=} ")
+    # print(f"junhan > {config.deallocate_pipeline_outputs=}")
 
     if config.deallocate_pipeline_outputs:
         custom_backward(output_tensor[0], output_tensor_grad[0])
@@ -1070,6 +1099,7 @@ def get_tensor_shapes(
     return tensor_shapes
 
 
+@nvtx.annotate(message=" recv forward", color="white", domain=f"Pipeline")
 def recv_forward(tensor_shapes, config):
     input_tensors = []
     for tensor_shape in tensor_shapes:
@@ -1080,6 +1110,7 @@ def recv_forward(tensor_shapes, config):
     return input_tensors
 
 
+@nvtx.annotate(message=" recv backward", color="white", domain=f"Pipeline")
 def recv_backward(tensor_shapes, config):
     output_tensor_grads = []
     for tensor_shape in tensor_shapes:
@@ -1087,9 +1118,11 @@ def recv_backward(tensor_shapes, config):
             output_tensor_grads.append(None)
         else:
             output_tensor_grads.append(p2p_communication.recv_backward(tensor_shape, config))
+            # print(f"junhan > {output_tensor_grads=}")
     return output_tensor_grads
 
 
+@nvtx.annotate(message=" send forward", color="white", domain=f"Pipeline")
 def send_forward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
@@ -1099,6 +1132,7 @@ def send_forward(output_tensors, tensor_shapes, config):
         p2p_communication.send_forward(output_tensor, config)
 
 
+@nvtx.annotate(message=" send backward", color="white", domain=f"Pipeline")
 def send_backward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
@@ -1106,8 +1140,11 @@ def send_backward(input_tensor_grads, tensor_shapes, config):
         if tensor_shape is None:
             continue
         p2p_communication.send_backward(input_tensor_grad, config)
+        # print(f"junhan > send backward {input_tensor_grad=}\n {input_tensor_grad.shape}")
+        # raise SystemExit
 
 
+@nvtx.annotate(message=" send forward recv backward", color="white", domain=f"Pipeline")
 def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
@@ -1123,6 +1160,7 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
     return output_tensor_grads
 
 
+@nvtx.annotate(message=" send backward recv forward", color="white", domain=f"Pipeline")
 def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
@@ -1137,6 +1175,20 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
         input_tensors.append(input_tensor)
     return input_tensors
 
+@nvtx.annotate(message=" send forward recv forward", color="white", domain=f"Pipeline")
+def send_forward_recv_forward(input_tensors, tensor_shapes, config):
+    if not isinstance(input_tensors, list):
+        input_tensors = [input_tensors]
+    recv_input_tensors = []
+    for (input_tensor, tensor_shape) in zip(input_tensors, tensor_shapes):
+        if tensor_shapes is None:
+            recv_input_tensors.append(None)
+            continue
+        recv_input_tensor = p2p_communication.send_forward_recv_forward(
+            output_tensor=input_tensor, recv_prev=True, tensor_shape=tensor_shape, config=config
+        )
+        recv_input_tensors.append(recv_input_tensor)
+    return recv_input_tensors
 
 def forward_backward_pipelining_without_interleaving(
     *,
@@ -1396,3 +1448,365 @@ def forward_backward_pipelining_without_interleaving(
         config.timers('forward-backward').stop()
 
     return forward_data_store
+
+def forward_backward_pipelining_without_interleaving1(
+        *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: int = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
+):
+    """Run non-interleaved 2F1B schedule, with communication between pipeline stages.
+    
+    Returns dictionary with losses if the last stage, empty dict otherwise."""
+    if isinstance(model, list):
+        assert (
+            len(model) == 1
+        ), "non-interleaved pipeline parallelism does not support model chunking"
+        model = model[0]
+    if isinstance(data_iterator, list):
+        assert (
+            len(data_iterator) == 1
+        ), "non-pipeline-parallel schedule does not support model chunking"
+        data_iterator = data_iterator[0]
+
+    config = get_model_config(model)
+    if config.overlap_p2p_comm:
+        raise ValueError(
+            "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
+        )
+
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    # Disable async grad reductions
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = None
+
+    def disable_grad_sync():
+        """Disable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+
+    def enable_grad_sync():
+        """Enable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+
+    disable_grad_sync()
+
+    # Compute number of warmup microbatches.
+    num_warmup_microbatches = (
+        parallel_state.get_pipeline_model_parallel_world_size()
+        - parallel_state.get_pipeline_model_parallel_rank()
+        - 1
+    )
+    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
+    num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+
+    model_type = get_model_type(model)
+
+    rank = parallel_state.get_pipeline_model_parallel_rank()
+    recv_tensor_shapes = get_tensor_shapes(
+            rank=rank - 1,
+            model_type=model_type,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            config=config,
+        )
+    send_tensor_shapes = get_tensor_shapes(
+        rank=rank,
+        model_type=model_type,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+    )
+
+    # Input, output tensors only need to be saved when doing backward passes
+    input_tensors = None
+    output_tensors = None
+    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+
+    if not forward_only:
+        input_tensors = []
+        output_tensors = []
+    forward_data_store = []
+
+    # Run warmup forward passes.
+    # TBD
+    # ...
+    print(f"junhan > [Rank {rank}] start to Run warmup forward passes ")
+    for i in range(num_warmup_microbatches):
+        checkpoint_activations_microbatch = None
+
+        input_tensor = recv_forward(recv_tensor_shapes, config)
+        with torch.no_grad():
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(first_val_step, forward_only, i == 0),
+                current_microbatch=i,
+            )
+        send_forward(output_tensor, send_tensor_shapes, config)
+        total_num_tokens += num_tokens.item()
+
+        if not forward_only:
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+    # Before running 1F1B, need to receive first forward tensor.
+    # If all microbatches are run in warmup / cooldown phase, then no need to
+    # receive this tensor here.
+    if num_microbatches_remaining > 0:
+        input_tensor = recv_forward(recv_tensor_shapes, config)
+
+    # Run 1F1B in steady state.
+    # TBD
+    # ...
+    print(f"junhan > [Rank {rank}] start to Run 1F1B in steady state ")
+    for i in range(num_microbatches_remaining):
+        last_iteration = i == (num_microbatches_remaining - 1)
+        checkpoint_activations_microbatch = None
+
+        print(f"junhan > [Rank {rank}] forward_step")
+        with torch.no_grad():
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i + num_warmup_microbatches,
+            )
+        total_num_tokens += num_tokens.item()
+
+        if forward_only:
+            send_forward(output_tensor, send_tensor_shapes, config)
+
+            if not last_iteration:
+                input_tensor = recv_forward(recv_tensor_shapes, config)
+        
+        else:
+            print(f"junhan > [Rank {rank}] [{i}/{num_microbatches_remaining} steps] start to send_forward_recv_forward")
+            # at this point, every rank should send forward and receive forward
+            # 不是先发送后接收，也不是先接收后发送，而是同时发送和接收，
+            # 在 _p2p_ops 里，奇数 rank 先发送后接收，偶数 rank 先接收后发送，从而避免堵塞
+            input_tensor_next = send_forward_recv_forward(
+                    output_tensor, send_tensor_shapes, config
+                )
+
+            # Add input_tensor and output_tensor to end of list.
+            input_tensors.append(input_tensor_next)
+            output_tensors.append(output_tensor)
+            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+            # Pop input_tensor and output_tensor from the start of the list for
+            # the backward pass.
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
+
+            # Do Re-forward
+            # WARNNING: What is the input tensor??? maybe I should save every input tensor in the first forward. check input_tensors
+            # WARNNING: What is the data_iterator??? Dose it have impact to forward step?
+            # WARNNING: What is the use of current_microbatch???
+            print(f"junhan > [Rank {rank}] reforward")
+            output_tensor, _ = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i,
+            )
+            print(f"junhan > [Rank {rank}] recv_backward")
+            output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+            # Enable grad sync for the last microbatch in the batch if the full
+            # backward pass completes in the 1F1B stage.
+            if num_warmup_microbatches == 0 and last_iteration:
+                if config.grad_sync_func is None or rank == 0:
+                    enable_grad_sync()
+            
+            # WARNING: Why input tensor is need in backward step???
+            print(f"junhan > [Rank {rank}] backward_step")
+
+            print(f"""\n{input_tensor=}\n 
+                  {output_tensor=}\n 
+                  {output_tensor_grad=}\n""")
+
+            input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            )
+            print(f"junhan > [Rank {rank}] send_backward")
+            print(f"junhan > {input_tensor_grad=}")
+
+            if last_iteration:
+                input_tensor = None
+                send_backward(input_tensor_grad, recv_tensor_shapes, config)
+            else:
+                input_tensor = input_tensor_next
+                send_backward(input_tensor_grad, recv_tensor_shapes, config)
+
+    # Run cooldown backward passes.
+    # TBD
+    # ...
+    print(f"junhan > [Rank {rank}] start to Run cooldown backward passes ")
+    if not forward_only:
+        for i in range(num_warmup_microbatches):
+            # Enable async grad reduction in the last backward pass
+            # Note: If grad sync function is provided, only enable
+            # async grad reduction in first pipeline stage. Other
+            # pipeline stages do grad reduction during pipeline
+            # bubble.
+            if i == num_warmup_microbatches - 1:
+                if config.grad_sync_func is None or rank == 0:
+                    enable_grad_sync()
+
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
+
+            output_tensor, _ = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i + num_warmup_microbatches,
+            )
+
+            output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+            input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            )
+
+            send_backward(input_tensor_grad, recv_tensor_shapes, config)
+
+        # Launch any remaining grad reductions.
+        if no_sync_context is not None:
+            enable_grad_sync()
+            if config.grad_sync_func is not None:
+                config.grad_sync_func(model.parameters())
+
+
+    if config.finalize_model_grads_func is not None and not forward_only:
+        # Finalize model grads (perform full grad all-reduce / reduce-scatter for
+        # data parallelism, layernorm all-reduce for sequence parallelism, and
+        # embedding all-reduce for pipeline parallelism).
+        config.finalize_model_grads_func([model], total_num_tokens)
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
+
+
+    return forward_data_store
+# class save_on_cpu(torch.autograd.graph.saved_tensors_hooks):
+#     def __init__(self, pin_memory=False, device_type="cuda"):
+#         device_module = getattr(torch, device_type, torch.cuda)
+
+#         def pack_to_cpu(tensor):
+#             if not pin_memory:
+#                 return (tensor.device, tensor.cpu())
+#             packed = torch.empty(
+#                 tensor.size(),
+#                 dtype=tensor.dtype,
+#                 layout=tensor.layout,
+#                 pin_memory=(device_module.is_available() and not tensor.is_sparse),
+#             )
+#             packed.copy_(tensor)
+#             return (tensor.device, packed)
+
+#         def unpack_from_cpu(packed):
+#             device, tensor = packed
+#             return tensor.to(device, non_blocking=pin_memory)
+
+#         super().__init__(pack_to_cpu, unpack_from_cpu)
+
+
+# activation_list = [[None] * 1000]
+# activation_list_cpu = [[None] * 1000]
+# offload_open = True
+
+# # activation_memory = 0
+
+# class print_activation(torch.autograd.graph.saved_tensors_hooks):
+#     def __init__(self, rank, micro_batch_id):
+#         self.micro_batch_id = micro_batch_id
+#         self.rank = rank
+#         self.tensor_id = 0
+
+                
+#         global activation_list
+#         global activation_list_cpu
+#         self.activation_list = activation_list[micro_batch_id]
+#         self.activation_list_cpu = activation_list_cpu[micro_batch_id]
+
+#         def pack_hook(tensor):
+#             # print(f"[Rank {parallel_state.get_pipeline_model_parallel_rank()}] {tensor.dtype=}")
+#             # print(f"[Rank {parallel_state.get_pipeline_model_parallel_rank()}] {tensor.shape=}")
+#             # global activation_memory
+#             # activation_memory += tensor.element_size() * tensor.numel()
+#             # print(f"junhan > [Rank {self.rank}] Tensor size: {activation_memory / 1024 / 1024} MB")
+
+#             self.add(tensor) 
+#             return self.tensor_id - 1
+#             # return tensor
+
+#         def unpack_hook(tensor_id):
+#             return self.get(tensor_id)
+#             # return tensor_id
+#         super().__init__(pack_hook, unpack_hook)
+
+#     def add(self, tensor):
+#         self.activation_list[self.tensor_id] = tensor
+#         if self.activation_list_cpu[self.tensor_id] is None:
+#             self.activation_list_cpu[self.tensor_id] = torch.empty_like(tensor, device="cpu").pin_memory()
+#         self.tensor_id += 1
+        
+
+#     def get(self, tensor_id):
+#         # assert self.activation_list[tensor_id]
+#         return self.activation_list[tensor_id]
