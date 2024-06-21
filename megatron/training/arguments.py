@@ -148,6 +148,9 @@ def validate_args(args, defaults={}):
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
 
+    if args.use_2f1b:
+        args.input_tensor_queue=[]
+
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -1015,6 +1018,10 @@ def _add_training_args(parser):
                        '0=off, 1=moderate, 2=aggressive.')
     group.add_argument('--check-weight-hash-across-dp-replicas-interval', type=int, default=None,
                        help='Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked.')
+    group.add_argument('--use-2f1b', action='store_true',
+                       help='replace 2f1b to 1f1b without interleaved')
+    group.add_argument('--no-recompute-stages', nargs='+', type=int, default=[],
+                       help='Specify stages that should not be recomputed to increase throughput, at the expense of higher memory usage.')
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',

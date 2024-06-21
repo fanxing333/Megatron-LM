@@ -154,7 +154,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     )
 
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(data_iterator, model: GPTModel, is_reforward=False):
     """Forward training step.
 
     Args:
@@ -168,8 +168,16 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
+        # 为了防止在使用 2F1B 时，Reforward 重新从 DataLoader 中拿取新数据
+        if args.use_2f1b:
+            if not is_reforward:
+                tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+                # 如果第一个 stage 不做重计算，那这里的append是浪费的，但一般都会做。如果不是第一个stage，其他stage会append[None, None, None, None, None]
+                args.input_tensor_queue.append([tokens, labels, loss_mask, attention_mask, position_ids])
+            else:
+                tokens, labels, loss_mask, attention_mask, position_ids = args.input_tensor_queue.pop(0)
+        else:
+            tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
     timers('batch-generator').stop()
 
     with stimer:
