@@ -255,6 +255,101 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
+# same as forward_step
+def re_forward_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches,
+    input_tensor,
+    forward_data_store,
+    config,
+    collect_non_loss_data=False,
+    checkpoint_activations_microbatch=None,
+    is_first_microbatch=False,
+    current_microbatch=None,
+):
+
+    """Forward step for passed-in model.
+
+    If first stage, input tensor is obtained from data_iterator, otherwise
+    passed-in input_tensor is used.
+
+    Returns output tensor."""
+    if config.timers is not None:
+        config.timers('forward-compute', log_level=2).start()
+
+    if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
+        model.set_is_first_microbatch()
+    if current_microbatch is not None:
+        set_current_microbatch(model, current_microbatch)
+
+    unwrap_output_tensor = False
+    if not isinstance(input_tensor, list):
+        input_tensor = [input_tensor]
+        unwrap_output_tensor = True
+
+    set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
+    set_input_tensor(input_tensor)
+
+    if config.enable_autocast:
+        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+    else:
+        context_manager = contextlib.nullcontext()
+    with context_manager:
+        if checkpoint_activations_microbatch is None:
+            output_tensor, loss_func = forward_step_func(data_iterator, model)
+        else:
+            output_tensor, loss_func = forward_step_func(
+                data_iterator, model, checkpoint_activations_microbatch
+            )
+
+    num_tokens = torch.tensor(0, dtype=torch.int)
+    if parallel_state.is_pipeline_last_stage():
+        if not collect_non_loss_data:
+            outputs = loss_func(output_tensor)
+            if len(outputs) == 3:
+                output_tensor, num_tokens, loss_reduced = outputs
+            else:
+                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
+                assert len(outputs) == 2
+                output_tensor, loss_reduced = outputs
+                output_tensor = output_tensor / num_microbatches
+            forward_data_store.append(loss_reduced)
+        else:
+            data = loss_func(output_tensor, non_loss_data=True)
+            forward_data_store.append(data)
+
+    if config.timers is not None:
+        config.timers('forward-compute').stop()
+
+    # Set the loss scale for the auxiliary loss of the MoE layer.
+    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale explicitly.
+    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.tensor(1.0, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.tensor(1.0)
+        )
+        # Set the loss scale
+        MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # If T5 model (or other model with encoder and decoder)
+    # and in decoder stack, then send encoder_hidden_state
+    # downstream as well.
+    model_type = get_model_type(model)
+    if (
+        parallel_state.is_pipeline_stage_after_split()
+        and model_type == ModelType.encoder_and_decoder
+    ):
+        return [output_tensor, input_tensor[-1]], num_tokens
+
+    if unwrap_output_tensor:
+        return output_tensor, num_tokens
+    return [output_tensor], num_tokens
+
+
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
@@ -1365,6 +1460,25 @@ def forward_backward_pipelining_without_interleaving(
             # 发送上一个前向传播的激活块
             transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id, status="backward", is_forward_only=forward_only)
 
+            if is_need_recompute(stage_id=rank, microbatch_id=backward_microbatch_id):
+                output_tensor, _ = re_forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    checkpoint_activations_microbatch,
+                    check_first_val_step(
+                        first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                    ),
+                    current_microbatch=backward_microbatch_id,
+                )
+                deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
@@ -1400,6 +1514,24 @@ def forward_backward_pipelining_without_interleaving(
             transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id, status="backward", is_forward_only=forward_only)
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+            if is_need_recompute(stage_id=rank, microbatch_id=backward_microbatch_id):
+                output_tensor, _ = re_forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    checkpoint_activations_microbatch,
+                    check_first_val_step(
+                        first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                    ),
+                    current_microbatch=backward_microbatch_id,
+                )
+                deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
@@ -1544,8 +1676,21 @@ def get_forward_context(stage_id: int, microbatch_id: int, is_forward_only: bool
         )
     
     elif forward_op == "f2":
-        # 暂时先不处理重计算
-        return contextlib.nullcontext()
+        # 返回推理模式上下文
+        return torch.no_grad()
     
     else:
         raise NotImplementedError(f"未知的前向传播策略: {forward_op=}")
+    
+
+def is_need_recompute(stage_id: int, microbatch_id: int):
+    global policy
+
+    if len(policy) == 0:
+        return False
+    
+    backward_op = policy[stage_id][microbatch_id]["backward"]["computation"]
+    if backward_op == "b2":
+        return True
+    else:
+        return False
