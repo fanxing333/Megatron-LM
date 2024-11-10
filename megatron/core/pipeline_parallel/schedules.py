@@ -1249,6 +1249,8 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -1261,19 +1263,27 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            checkpoint_activations_microbatch,
-            check_first_val_step(first_val_step, forward_only, i == 0),
-            current_microbatch=i,
-        )
+
+        # 选择前向传播上下文
+        forward_context = get_forward_context(stage_id=rank, microbatch_id=i, is_forward_only=forward_only)
+        # 选择 offloading，理论上来说应该先进行异步发送，再接收上一个 stage 发送过来的输出激活值
+        transfer_activation_to_target_device(stage_id=rank, microbatch_id=i, status="forward", is_forward_only=forward_only)
+        
+        with forward_context:
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(first_val_step, forward_only, i == 0),
+                current_microbatch=i,
+            )
+
         send_forward(output_tensor, send_tensor_shapes, config)
         total_num_tokens += num_tokens.item()
 
@@ -1300,21 +1310,29 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            checkpoint_activations_microbatch,
-            check_first_val_step(
-                first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
-            ),
-            current_microbatch=i + num_warmup_microbatches,
-        )
+        # 选择前向传播上下文
+        forward_microbatch_id = i + num_warmup_microbatches
+        backward_microbatch_id = i
+        
+        forward_context = get_forward_context(stage_id=rank, microbatch_id=forward_microbatch_id, is_forward_only=forward_only)
+        transfer_activation_to_target_device(stage_id=rank, microbatch_id=forward_microbatch_id, status="forward", is_forward_only=forward_only)
+
+        with forward_context:
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i + num_warmup_microbatches,
+            )
         total_num_tokens += num_tokens.item()
 
         if forward_only:
@@ -1344,9 +1362,15 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            # 发送上一个前向传播的激活块
+            transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id, status="backward", is_forward_only=forward_only)
+
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+
+            # b1 反向传播后及时删除 storage 中的激活块
+            storage_clear(stage_id=rank, microbatch_id=backward_microbatch_id)
 
             if last_iteration:
                 input_tensor = None
@@ -1372,11 +1396,16 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
+            backward_microbatch_id = num_microbatches - num_warmup_microbatches + i
+            transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id, status="backward", is_forward_only=forward_only)
+
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+
+            storage_clear(stage_id=rank, microbatch_id=backward_microbatch_id)
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
 
@@ -1396,3 +1425,127 @@ def forward_backward_pipelining_without_interleaving(
         config.timers('forward-backward').stop()
 
     return forward_data_store
+
+
+import json
+
+def read_json_file(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data
+
+file_path = '/home/zkrh/shijh/policy/policy.json'
+policy = read_json_file(file_path)
+
+def pack(x):
+    # print("Packing: ", x.shape)
+    return x.to('cuda:3')
+
+def unpack(x):
+    # print("Unpacking: ", x.shape)
+    return x.to('cuda:0')
+
+# 创建一个空字典，key 对应 microbatch_id，value 对应其中间激活值
+storage = {i: [] for i in range(len(policy[0]))}
+
+transfer_streams = [torch.cuda.Stream(device=f'cuda:{i}') for i in range(len(policy))]
+
+# 输入前向传播中产生的激活值 x 和对应的 microbatch_id，返回其在 storage[microbatch_id] 中的索引
+def pack_to_storage(x, microbatch_id):
+    global storage
+    storage[microbatch_id].append(x)
+    # print(f"{microbatch_id=}, x_idx={len(storage[microbatch_id]) - 1}")
+    # del x
+
+    return len(storage[microbatch_id]) - 1
+
+def unpack_from_storage(x_idx, microbatch_id):
+    global storage
+    # print(f"{microbatch_id=}, {x_idx=}")
+    tensor = storage[microbatch_id][x_idx]
+    return tensor
+
+def transfer_activation_to_target_device(stage_id: int, microbatch_id: int, status: str, is_forward_only: bool):
+    """
+    stage_id: 当前 stage
+    microbatch_id: 当前 microbatch_id，不代表需要 offload 的 microbatch_id
+    status: 'forward' or 'backward'
+
+    WARNING: 如果是将 tensor 传回，需要在对应的反向传播做完后及时删除
+    WARNING: 如何实现异步传输？
+    """
+    global policy
+    global storage
+
+    if len(policy) == 0:
+        return
+    if is_forward_only:
+        return
+    
+    communication_op = policy[stage_id][microbatch_id][status]["communication"]
+    if communication_op:
+        target_op = communication_op["op"]
+        target_microbatch_id = communication_op["microbatch_id"]
+        target_stage = communication_op["target_stage"]
+        if target_op == "pushMicrobatchActivation":
+            target_device = f"cuda:{target_stage}"
+        elif target_op == "pullMicrobatchActivation":
+            target_device = f"cuda:{stage_id}"
+        else:
+            raise NotImplementedError(f"未知的传输策略 {target_op=}")
+    
+        with torch.cuda.stream(transfer_streams[stage_id]):
+            for idx, tensor in enumerate(storage[target_microbatch_id]):
+                # tensor.to_('cuda:3')  # to_ inplace op ?
+                # print(f"{microbatch_id=}, {target_device=}, current_device={tensor.device}, tensor type={storage[microbatch_id][idx].type()}")
+                storage[target_microbatch_id][idx] = storage[target_microbatch_id][idx].to(target_device, non_blocking=True)
+            # torch.cuda.empty_cache()
+
+
+import gc
+def storage_clear(stage_id: int, microbatch_id: int):
+    """
+    如果是 b1 类型的反向传播，在完成反向传播后应该及时释放 storage 中的空间
+    """
+    global policy
+    global storage
+    if len(policy) == 0:
+        return
+    
+    computation_op = policy[stage_id][microbatch_id]["backward"]["computation"]
+    if computation_op == "b1":
+        storage[microbatch_id].clear()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+
+
+def get_forward_context(stage_id: int, microbatch_id: int, is_forward_only: bool):
+    """
+    如果有策略，则根据策略里对应的
+    policy[stage][microbatch]["forward"] == "f0", "f1", or "f2"
+    返回正确的前向传播上下文
+    """
+    global policy
+    # 没有策略，返回空上下文
+    if len(policy) == 0:
+        return contextlib.nullcontext()
+    # 推理模式，返回空上下文
+    if is_forward_only:
+        return contextlib.nullcontext()
+    
+    forward_op = policy[stage_id][microbatch_id]["forward"]["computation"]
+    if forward_op == "f0":
+        return contextlib.nullcontext()
+    
+    elif forward_op == "f1":
+        return torch.autograd.graph.saved_tensors_hooks(
+            lambda x, mb_id=microbatch_id: pack_to_storage(x, microbatch_id=mb_id),
+            lambda x_idx, mb_id=microbatch_id: unpack_from_storage(x_idx, microbatch_id=mb_id)
+        )
+    
+    elif forward_op == "f2":
+        # 暂时先不处理重计算
+        return contextlib.nullcontext()
+    
+    else:
+        raise NotImplementedError(f"未知的前向传播策略: {forward_op=}")
