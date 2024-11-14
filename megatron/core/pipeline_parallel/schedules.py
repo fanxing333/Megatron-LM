@@ -1344,7 +1344,17 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
-    
+    from megatron.training.global_vars import get_args
+    args = get_args()
+    current_gpu = torch.cuda.current_device()
+    if args.policy is not None:
+        global policy
+        global transfer_stream
+        global storage
+        
+        policy = args.policy
+        transfer_stream = torch.cuda.Stream(device=f'cuda:{current_gpu}')
+        storage = {i: [] for i in range(len(policy[0]))}
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
@@ -1559,15 +1569,11 @@ def forward_backward_pipelining_without_interleaving(
     return forward_data_store
 
 
-import json
 
-def read_json_file(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    return data
+policy = []
+storage = {}
+transfer_stream = None
 
-file_path = '/home/zkrh/shijh/policy/policy.json'
-policy = read_json_file(file_path)
 
 def pack(x):
     # print("Packing: ", x.shape)
@@ -1577,17 +1583,10 @@ def unpack(x):
     # print("Unpacking: ", x.shape)
     return x.to('cuda:0')
 
-# 创建一个空字典，key 对应 microbatch_id，value 对应其中间激活值
-storage = {i: [] for i in range(len(policy[0]))}
-
-transfer_streams = [torch.cuda.Stream(device=f'cuda:{i}') for i in range(len(policy))]
-
 # 输入前向传播中产生的激活值 x 和对应的 microbatch_id，返回其在 storage[microbatch_id] 中的索引
 def pack_to_storage(x, microbatch_id):
     global storage
     storage[microbatch_id].append(x)
-    # print(f"{microbatch_id=}, x_idx={len(storage[microbatch_id]) - 1}")
-    # del x
 
     return len(storage[microbatch_id]) - 1
 
@@ -1608,6 +1607,7 @@ def transfer_activation_to_target_device(stage_id: int, microbatch_id: int, stat
     """
     global policy
     global storage
+    global transfer_stream
 
     if len(policy) == 0:
         return
@@ -1626,7 +1626,7 @@ def transfer_activation_to_target_device(stage_id: int, microbatch_id: int, stat
         else:
             raise NotImplementedError(f"未知的传输策略 {target_op=}")
     
-        with torch.cuda.stream(transfer_streams[stage_id]):
+        with torch.cuda.stream(transfer_stream):
             for idx, tensor in enumerate(storage[target_microbatch_id]):
                 # tensor.to_('cuda:3')  # to_ inplace op ?
                 # print(f"{microbatch_id=}, {target_device=}, current_device={tensor.device}, tensor type={storage[microbatch_id][idx].type()}")

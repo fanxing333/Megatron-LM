@@ -520,6 +520,24 @@ def validate_args(args, defaults={}):
     if args.use_tp_pp_dp_mapping:
         assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
             "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
+        
+    # OmniPipe Policy checks
+    if args.policy_file is not None:
+        # 读取 policy_file
+        if not os.path.exists(args.policy_file):
+            raise ValueError(f"policy_file 路径不存在: {args.policy_file}")
+
+        with open(args.policy_file, 'r', encoding='utf-8') as f:
+            try:
+                policy = json.load(f)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"无法解析 policy_file: {args.policy_file}. 错误: {e}")
+        
+        # 并行配置检查
+        assert len(policy) == args.pipeline_model_parallel_size
+        assert len(policy[0]) == args.global_batch_size // args.micro_batch_size // args.data_parallel_size
+            
+        args.policy = policy
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1015,6 +1033,10 @@ def _add_training_args(parser):
                        '0=off, 1=moderate, 2=aggressive.')
     group.add_argument('--check-weight-hash-across-dp-replicas-interval', type=int, default=None,
                        help='Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked.')
+    
+    group.add_argument('--policy-file', type=str, default=None, help='根据策略文件来进行调度')
+    parser.add_argument('--policy', type=list, default=None,
+                       help='Policy configuration as a list of dictionaries')
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
