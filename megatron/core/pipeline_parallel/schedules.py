@@ -252,6 +252,8 @@ def forward_step(
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
+    global current_idx
+    current_idx = -1
     return [output_tensor], num_tokens
 
 
@@ -1344,17 +1346,9 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
-    from megatron.training.global_vars import get_args
-    args = get_args()
-    current_gpu = torch.cuda.current_device()
-    if args.policy is not None:
-        global policy
-        global transfer_stream
-        global storage
-        
-        policy = args.policy
-        transfer_stream = torch.cuda.Stream(device=f'cuda:{current_gpu}')
-        storage = {i: [] for i in range(len(policy[0]))}
+    policy_init()
+    global transfer_stream
+    global storage_init
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
@@ -1388,6 +1382,8 @@ def forward_backward_pipelining_without_interleaving(
                 check_first_val_step(first_val_step, forward_only, i == 0),
                 current_microbatch=i,
             )
+            if storage_init_tag:
+                storage_init = True
 
         send_forward(output_tensor, send_tensor_shapes, config)
         total_num_tokens += num_tokens.item()
@@ -1422,6 +1418,7 @@ def forward_backward_pipelining_without_interleaving(
         forward_context = get_forward_context(stage_id=rank, microbatch_id=forward_microbatch_id, is_forward_only=forward_only)
         transfer_activation_to_target_device(stage_id=rank, microbatch_id=forward_microbatch_id, status="forward", is_forward_only=forward_only)
 
+        # try:
         with forward_context:
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
@@ -1438,6 +1435,11 @@ def forward_backward_pipelining_without_interleaving(
                 ),
                 current_microbatch=i + num_warmup_microbatches,
             )
+            if storage_init_tag:
+                storage_init = True
+        # except:
+        #     print(f"{rank=}, {forward_microbatch_id=}")
+
         total_num_tokens += num_tokens.item()
 
         if forward_only:
@@ -1571,8 +1573,39 @@ def forward_backward_pipelining_without_interleaving(
 
 
 policy = []
-storage = {}
 transfer_stream = None
+target_device = None
+current_device = None
+policy_state = False
+storage_init = False
+storage_init_tag = False
+
+prefetch_storage = []
+remote_device_storage = []
+
+current_idx = -1
+
+def policy_init():
+    global policy_state
+    if policy_state:
+        return
+    
+    from megatron.training.global_vars import get_args
+    args = get_args()
+    if args.policy is not None:
+        global policy
+        global transfer_stream
+        global target_device
+        global current_device
+        current_device = torch.cuda.current_device()
+        policy = args.policy
+        # target_device = len(policy) - current_device - 1
+        target_device = (len(policy) - parallel_state.get_pipeline_model_parallel_rank() - 1) * parallel_state.get_tensor_model_parallel_world_size() + parallel_state.get_tensor_model_parallel_rank()
+        
+        transfer_stream = torch.cuda.Stream(device=f'cuda:{current_device}')
+        policy_state = True
+
+        print(f"Policy 参数检查: {current_device=}, {target_device=}, {parallel_state.get_pipeline_model_parallel_rank()=}, {parallel_state.get_tensor_model_parallel_rank()=}, {args.rank=}")
 
 
 def pack(x):
@@ -1583,18 +1616,39 @@ def unpack(x):
     # print("Unpacking: ", x.shape)
     return x.to('cuda:0')
 
+def pack_to_storage_immediate_transfer(x, microbatch_id):
+    global remote_device_storage
+    global prefetch_storage
+    global current_idx
+
+    current_idx += 1
+
+    if microbatch_id == 3 and len(prefetch_storage)<299:
+        prefetch_storage.append(torch.empty(tuple(x.shape), dtype=x.dtype, device=f"cuda:{current_device}"))
+    remote_device_storage.append(x.to(device=f"cuda:{target_device}", non_blocking=True))
+
+    return current_idx
+
 # 输入前向传播中产生的激活值 x 和对应的 microbatch_id，返回其在 storage[microbatch_id] 中的索引
 def pack_to_storage(x, microbatch_id):
-    global storage
-    storage[microbatch_id].append(x)
+    global remote_device_storage
+    global prefetch_storage
+    global current_idx
 
-    return len(storage[microbatch_id]) - 1
+    current_idx += 1
+
+    # 第一个 f0 做完即可完成初始化
+    if not storage_init:
+        remote_device_storage.append(torch.empty(tuple(x.shape), dtype=x.dtype, device=f"cuda:{target_device}"))
+        prefetch_storage.append(None)
+    # print(len(prefetch_storage), len(remote_device_storage))
+    prefetch_storage[current_idx] = x.detach().clone().to(device=f"cuda:{current_device}", non_blocking=True)
+
+    return current_idx
 
 def unpack_from_storage(x_idx, microbatch_id):
-    global storage
-    # print(f"{microbatch_id=}, {x_idx=}")
-    tensor = storage[microbatch_id][x_idx]
-    return tensor
+
+    return prefetch_storage[x_idx]
 
 def transfer_activation_to_target_device(stage_id: int, microbatch_id: int, status: str, is_forward_only: bool):
     """
@@ -1605,8 +1659,8 @@ def transfer_activation_to_target_device(stage_id: int, microbatch_id: int, stat
     WARNING: 如果是将 tensor 传回，需要在对应的反向传播做完后及时删除
     WARNING: 如何实现异步传输？
     """
-    global policy
-    global storage
+    global prefetch_storage
+    global remote_device_storage
     global transfer_stream
 
     if len(policy) == 0:
@@ -1617,21 +1671,20 @@ def transfer_activation_to_target_device(stage_id: int, microbatch_id: int, stat
     communication_op = policy[stage_id][microbatch_id][status]["communication"]
     if communication_op:
         target_op = communication_op["op"]
-        target_microbatch_id = communication_op["microbatch_id"]
-        target_stage = communication_op["target_stage"]
+        # target_microbatch_id = communication_op["microbatch_id"]
+        # target_stage = communication_op["target_stage"]
         if target_op == "pushMicrobatchActivation":
-            target_device = f"cuda:{target_stage}"
+            # return
+            with torch.cuda.stream(transfer_stream):
+                for idx, tensor in enumerate(prefetch_storage):
+                    remote_device_storage[idx].copy_(tensor, non_blocking=True)
         elif target_op == "pullMicrobatchActivation":
-            target_device = f"cuda:{stage_id}"
+            with torch.cuda.stream(transfer_stream):
+                for idx, tensor in enumerate(remote_device_storage):
+                    prefetch_storage[idx].copy_(tensor, non_blocking=True)
+
         else:
             raise NotImplementedError(f"未知的传输策略 {target_op=}")
-    
-        with torch.cuda.stream(transfer_stream):
-            for idx, tensor in enumerate(storage[target_microbatch_id]):
-                # tensor.to_('cuda:3')  # to_ inplace op ?
-                # print(f"{microbatch_id=}, {target_device=}, current_device={tensor.device}, tensor type={storage[microbatch_id][idx].type()}")
-                storage[target_microbatch_id][idx] = storage[target_microbatch_id][idx].to(target_device, non_blocking=True)
-            # torch.cuda.empty_cache()
 
 
 import gc
@@ -1640,17 +1693,19 @@ def storage_clear(stage_id: int, microbatch_id: int):
     如果是 b1 类型的反向传播，在完成反向传播后应该及时释放 storage 中的空间
     """
     global policy
-    global storage
+    global remote_device_storage
+    return
     if len(policy) == 0:
         return
     
     computation_op = policy[stage_id][microbatch_id]["backward"]["computation"]
     if computation_op == "b1":
-        storage[microbatch_id].clear()
+        # microbatch_id = 0
+        # storage[microbatch_id].clear()
         # gc.collect()
         # torch.cuda.empty_cache()
-
-
+        remote_device_storage.clear()
+        
 def get_forward_context(stage_id: int, microbatch_id: int, is_forward_only: bool):
     """
     如果有策略，则根据策略里对应的
@@ -1670,10 +1725,17 @@ def get_forward_context(stage_id: int, microbatch_id: int, is_forward_only: bool
         return contextlib.nullcontext()
     
     elif forward_op == "f1":
+        global target_device
+        global storage_init_tag
+        storage_init_tag = True
         return torch.autograd.graph.saved_tensors_hooks(
+            # lambda x, mb_id=microbatch_id: pack_to_storage_immediate_transfer(x, microbatch_id=mb_id),
             lambda x, mb_id=microbatch_id: pack_to_storage(x, microbatch_id=mb_id),
             lambda x_idx, mb_id=microbatch_id: unpack_from_storage(x_idx, microbatch_id=mb_id)
+            # lambda x: pack(x),
+            # lambda x: unpack(x)
         )
+
     
     elif forward_op == "f2":
         # 返回推理模式上下文
