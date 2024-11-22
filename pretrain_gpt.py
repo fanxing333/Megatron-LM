@@ -277,3 +277,9 @@ if __name__ == "__main__":
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
+
+    rank = torch.distributed.get_rank()
+    memory_str = f"[rank {rank:2d}] Memory: " + \
+             f"Allocated = {torch.cuda.max_memory_allocated() / 1024 / 1024:>8.2f} MB, " + \
+             f"Reserved = {torch.cuda.max_memory_reserved() / 1024 / 1024:>8.2f} MB"
+    print(f"{memory_str:<80}", flush=True)  # 80是总宽度
