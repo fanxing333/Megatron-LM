@@ -18,6 +18,7 @@ import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+from pynvml import *
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
@@ -1048,6 +1049,23 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
+        if args.rank == 0 and iteration == 10:
+            nvmlInit()
+            device_count = nvmlDeviceGetCount()
+            info = []
+            
+            for i in range(device_count):
+                handle = nvmlDeviceGetHandleByIndex(i)
+                info.append({
+                    # 'total_memory': nvmlDeviceGetMemoryInfo(handle).total / 1024**2,  # MB
+                    'used_memory': nvmlDeviceGetMemoryInfo(handle).used / 1024**2,    # MB
+                    # 'free_memory': nvmlDeviceGetMemoryInfo(handle).free / 1024**2,    # MB
+                    # 'gpu_util': nvmlDeviceGetUtilizationRates(handle).gpu,            # %
+                    # 'memory_util': nvmlDeviceGetUtilizationRates(handle).memory       # %
+                })
+            
+            nvmlShutdown()
+            print(f"{info=}")
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:

@@ -1857,6 +1857,313 @@ def forward_backward_pipelining_without_interleaving(
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
+        
+    if config.finalize_model_grads_func is not None and not forward_only:
+
+        # If defer_embedding_wgrad_compute is enabled we need to do the
+        # weight gradient GEMM's here.
+        finish_embedding_wgrad_compute(config, embedding_module)
+
+        # Finalize model grads (perform full grad all-reduce / reduce-scatter for
+        # data parallelism, layernorm all-reduce for sequence parallelism, and
+        # embedding all-reduce for pipeline parallelism).
+        config.finalize_model_grads_func(
+            [model], total_num_tokens if config.calculate_per_token_loss else None
+        )
+
+    if config.timers is not None:
+        config.timers('forward-backward').stop()
+
+    return forward_data_store
+
+
+def forward_backward_pipelining_without_interleaving_offloading(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: int = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
+):
+    """Run non-interleaved 1F1B schedule, with communication between pipeline
+    stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
+
+    if isinstance(model, list):
+        assert (
+            len(model) == 1
+        ), "non-interleaved pipeline-parallel schedule does not support model chunking"
+        model = model[0]
+    if isinstance(data_iterator, list):
+        assert (
+            len(data_iterator) == 1
+        ), "non-interleaved pipeline-parallel schedule does not support model chunking"
+        data_iterator = data_iterator[0]
+
+    config = get_model_config(model)
+    if config.overlap_p2p_comm:
+        raise ValueError(
+            "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
+        )
+
+    # Needed only when gradients are finalized in M-Core
+    if config.finalize_model_grads_func is not None and not forward_only:
+        embedding_module = clear_embedding_activation_buffer(config, model)
+
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    # Disable async grad reductions
+    no_sync_func = config.no_sync_func
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = None
+
+    def disable_grad_sync():
+        """Disable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+
+    def enable_grad_sync():
+        """Enable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+
+    disable_grad_sync()
+
+    # Compute number of warmup microbatches.
+    num_warmup_microbatches = (
+        parallel_state.get_pipeline_model_parallel_world_size()
+        - parallel_state.get_pipeline_model_parallel_rank()
+        - 1
+    )
+    num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
+    num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+
+    # Checkpoint the activations of partial Transformer layers in a number of micro-batches
+    # within the maximum outstanding micro-batch backpropagations.
+    # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
+    # checkpoint partial Transformer layers (or skip checkpointing) and
+    # the rest of micro-batches within a window of micro-batches checkpoint
+    # all Transformer layers. The window of micro-batches is set by the maximum
+    # outstanding backpropagations and becomes smaller at later pipeline stages.
+    # Please refer the appendix C in https://arxiv.org/pdf/2205.05198.pdf
+    max_outstanding_backprops = None
+    if config.num_microbatches_with_partial_activation_checkpoints is not None:
+        max_outstanding_backprops = num_warmup_microbatches + 1
+
+    model_type = get_model_type(model)
+    encoder_decoder_xattn = get_model_xattn(model)
+
+    rank = parallel_state.get_pipeline_model_parallel_rank()
+    recv_tensor_shapes = get_tensor_shapes(
+        rank=rank - 1,
+        model_type=model_type,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        encoder_decoder_xattn=encoder_decoder_xattn,
+    )
+    send_tensor_shapes = get_tensor_shapes(
+        rank=rank,
+        model_type=model_type,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        encoder_decoder_xattn=encoder_decoder_xattn,
+    )
+
+    # Input, output tensors only need to be saved when doing backward passes
+    input_tensors = None
+    output_tensors = None
+    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+
+    if not forward_only:
+        input_tensors = []
+        output_tensors = []
+    forward_data_store = []
+
+    policy_init()
+    global transfer_stream
+    global storage_init
+
+    # Run warmup forward passes.
+    for i in range(num_warmup_microbatches):
+        # Decide to checkpoint all layers' activations of the current micro-batch
+        if max_outstanding_backprops is not None:
+            checkpoint_activations_microbatch = (
+                i % max_outstanding_backprops
+                >= config.num_microbatches_with_partial_activation_checkpoints
+            )
+        else:
+            checkpoint_activations_microbatch = None
+
+        input_tensor = recv_forward(recv_tensor_shapes, config)
+
+        # 选择前向传播上下文
+        forward_context, forward_type = get_forward_context(stage_id=rank, microbatch_id=i, is_forward_only=forward_only)
+        # 选择 offloading，理论上来说应该先进行异步发送，再接收上一个 stage 发送过来的输出激活值
+        transfer_activation_to_target_device(stage_id=rank, microbatch_id=i-1, status="lazypush", is_forward_only=forward_only)
+
+        with forward_context:
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(first_val_step, forward_only, i == 0),
+                current_microbatch=i,
+                encoder_decoder_xattn=encoder_decoder_xattn,
+            )
+            if forward_type == 1:
+                storage_init = True
+
+        send_forward(output_tensor, send_tensor_shapes, config)
+        total_num_tokens += num_tokens.item()
+
+        if not forward_only:
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+    # Before running 1F1B, need to receive first forward tensor.
+    # If all microbatches are run in warmup / cooldown phase, then no need to
+    # receive this tensor here.
+    if num_microbatches_remaining > 0:
+        input_tensor = recv_forward(recv_tensor_shapes, config)
+
+    # Run 1F1B in steady state.
+    for i in range(num_microbatches_remaining):
+        last_iteration = i == (num_microbatches_remaining - 1)
+
+        # Decide to checkpoint all layers' activations of the current micro-batch
+        if max_outstanding_backprops is not None:
+            checkpoint_activations_microbatch = (
+                (i + num_warmup_microbatches) % max_outstanding_backprops
+            ) >= config.num_microbatches_with_partial_activation_checkpoints
+        else:
+            checkpoint_activations_microbatch = None
+
+        # 选择前向传播上下文
+        forward_microbatch_id = i + num_warmup_microbatches
+        backward_microbatch_id = i
+
+        forward_context, forward_type = get_forward_context(stage_id=rank, microbatch_id=forward_microbatch_id, is_forward_only=forward_only)
+        if i == 0:
+            transfer_activation_to_target_device(stage_id=rank, microbatch_id=forward_microbatch_id-1, status="lazypush", is_forward_only=forward_only)
+        
+        transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id, status="prefetch", is_forward_only=forward_only)
+
+        with forward_context:
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i + num_warmup_microbatches,
+                encoder_decoder_xattn=encoder_decoder_xattn,
+            )
+            if forward_type == 1:
+                storage_init = True
+
+        total_num_tokens += num_tokens.item()
+
+        if forward_only:
+            send_forward(output_tensor, send_tensor_shapes, config)
+
+            if not last_iteration:
+                input_tensor = recv_forward(recv_tensor_shapes, config)
+
+        else:
+            output_tensor_grad = send_forward_recv_backward(
+                output_tensor, send_tensor_shapes, config
+            )
+
+            # Add input_tensor and output_tensor to end of list.
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+            # Pop input_tensor and output_tensor from the start of the list for
+            # the backward pass.
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
+
+            # Enable grad sync for the last microbatch in the batch if the full
+            # backward pass completes in the 1F1B stage.
+            if num_warmup_microbatches == 0 and last_iteration:
+                if config.grad_sync_func is None or rank == 0:
+                    enable_grad_sync()
+
+            transfer_activation_to_target_device(stage_id=rank, microbatch_id=forward_microbatch_id, status="lazypush", is_forward_only=forward_only)
+
+            input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            )
+
+            if last_iteration:
+                input_tensor = None
+                send_backward(input_tensor_grad, recv_tensor_shapes, config)
+            else:
+                input_tensor = send_backward_recv_forward(
+                    input_tensor_grad, recv_tensor_shapes, config
+                )
+
+    # Run cooldown backward passes.
+    if not forward_only:
+        for i in range(num_warmup_microbatches):
+
+            # Enable async grad reduction in the last backward pass
+            # Note: If grad sync function is provided, only enable
+            # async grad reduction in first pipeline stage. Other
+            # pipeline stages do grad reduction during pipeline
+            # bubble.
+            if i == num_warmup_microbatches - 1:
+                if config.grad_sync_func is None or rank == 0:
+                    enable_grad_sync()
+
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
+
+            backward_microbatch_id = num_microbatches - num_warmup_microbatches + i
+            transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id+1, status="prefetch", is_forward_only=forward_only)
+
+            output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+            input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            )
+
+            send_backward(input_tensor_grad, recv_tensor_shapes, config)
+
+        # Launch any remaining grad reductions.
+        if no_sync_context is not None:
+            enable_grad_sync()
+            if config.grad_sync_func is not None:
+                config.grad_sync_func(model.parameters())
 
     if config.finalize_model_grads_func is not None and not forward_only:
 
@@ -1875,3 +2182,145 @@ def forward_backward_pipelining_without_interleaving(
         config.timers('forward-backward').stop()
 
     return forward_data_store
+
+
+# 全局参数
+# offloading 策略
+is_policy_init = False
+policy_4pp_8mb = [[1,0,0,0,1,0,0,0], 
+                  [0,0,0,0,0,0,0,0], 
+                  [0,0,0,0,0,0,0,0], 
+                  [0,0,0,0,0,0,0,0]]
+
+policy_8pp_8mb = [[1,1,1,1,1,1,1,1], 
+                  [0,0,0,0,0,0,0,0], 
+                  [0,0,0,0,0,0,0,0], 
+                  [0,0,0,0,0,0,0,0],
+                  [0,0,0,0,0,0,0,0],
+                  [0,0,0,0,0,0,0,0],
+                  [0,0,0,0,0,0,0,0],
+                  [0,0,0,0,0,0,0,0]]
+
+policy = policy_8pp_8mb
+
+current_device = None
+remote_device = None
+
+current_device_storage = []
+remote_device_storage = []
+n_remote_buffer = None
+storage_init = False
+current_idx = -1
+
+def policy_init():
+    global is_policy_init
+    if is_policy_init:
+        return
+    
+    from megatron.training.global_vars import get_args
+    args = get_args()
+    if policy is not None:
+        global transfer_stream
+        global remote_device
+        global current_device
+        global n_remote_buffer
+
+        current_device = torch.cuda.current_device()
+        remote_device = (len(policy) - parallel_state.get_pipeline_model_parallel_rank() - 1) * parallel_state.get_tensor_model_parallel_world_size() + parallel_state.get_tensor_model_parallel_rank()
+        
+        transfer_stream = torch.cuda.Stream(device=f'cuda:{current_device}')
+
+        n_remote_buffer = len(policy)
+        is_policy_init = True
+
+        print(f"Policy 参数检查: {current_device=}, {remote_device=}, {parallel_state.get_pipeline_model_parallel_rank()=}, {parallel_state.get_tensor_model_parallel_rank()=}, {args.rank=}")
+
+
+# 输入前向传播中产生的激活值 x 和对应的 microbatch_id，返回其在 storage[microbatch_id] 中的索引
+def pack_to_storage(x, microbatch_id):
+    global remote_device_storage
+    global current_device_storage
+    global current_idx
+
+    current_idx += 1
+    # 第一个需要 offloading 的前向传播做完即可完成 当前设备 和 远程设备 的空间初始化
+    if not storage_init:
+        remote_device_storage.append(torch.empty(tuple(x.shape), dtype=x.dtype, device=f"cuda:{remote_device}"))
+        current_device_storage.append(torch.empty(tuple(x.shape), dtype=x.dtype, device=f"cuda:{current_device}"))
+    
+    current_device_storage[current_idx].copy_(x.detach(), non_blocking=True)
+
+    return current_idx
+
+def unpack_from_storage(x_idx, microbatch_id):
+    # print(f"{current_device_storage[x_idx]=}, {current_device_storage[x_idx].dtype=}")
+
+    return current_device_storage[x_idx]
+
+
+def transfer_activation_to_target_device(stage_id: int, microbatch_id: int, status: str, is_forward_only: bool):
+    """
+    stage_id: 当前 stage
+    microbatch_id: 检查 microbatch_id 是否需要发射或预取
+    status: 'lazypush' or 'prefetch'
+
+    WARNING: 如果是将 tensor 传回，需要在对应的反向传播做完后及时删除
+    WARNING: 如何实现异步传输？
+    """
+    global current_device_storage
+    global remote_device_storage
+    global transfer_stream
+
+    if is_forward_only:
+        return
+    
+    if microbatch_id < 0 or microbatch_id >= (len(policy[0])):
+        return
+    
+    if policy[stage_id][microbatch_id] == 1:
+        if status == "lazypush":
+            # return
+            with torch.cuda.stream(transfer_stream):
+                for idx, tensor in enumerate(current_device_storage):
+                    remote_device_storage[idx].copy_(tensor, non_blocking=True)
+
+        elif status == "prefetch":
+            with torch.cuda.stream(transfer_stream):
+                for idx, tensor in enumerate(remote_device_storage):
+                    current_device_storage[idx].copy_(tensor, non_blocking=True)
+
+        else:
+            raise NotImplementedError(f"未知的传输策略 {status=}")
+
+
+
+def get_forward_context(stage_id: int, microbatch_id: int, is_forward_only: bool):
+    """
+    如果有策略，则根据策略里对应的
+    policy[stage][microbatch] == 0, 1 or 2
+    返回正确的前向传播上下文
+    """
+    global current_idx
+    # 推理模式，返回空上下文
+    if is_forward_only:
+        return contextlib.nullcontext(), 0
+    
+    forward_op = policy[stage_id][microbatch_id]
+    if forward_op == 0:
+        return contextlib.nullcontext(), 0
+    
+    elif forward_op == 1:
+        current_idx = -1
+        return torch.autograd.graph.saved_tensors_hooks(
+            lambda x, mb_id=microbatch_id: pack_to_storage(x, microbatch_id=mb_id),
+            lambda x_idx, mb_id=microbatch_id: unpack_from_storage(x_idx, microbatch_id=mb_id)
+            # lambda x: pack(x),
+            # lambda x: unpack(x)
+        ), 1
+
+    # in branch offloading, recomputation is not implemented
+    elif forward_op == 2:
+        return torch.no_grad(), 2
+    
+    else:
+        raise NotImplementedError(f"未知的前向传播策略: {forward_op=}")
