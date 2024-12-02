@@ -1240,6 +1240,8 @@ def _add_training_args(parser):
                              'global batch, versus the default behavior of assuming all tokens are non-padded.'))
     group.add_argument('--train-sync-interval', type=int, default=None,
                        help='Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU.')
+    group.add_argument('--offloading', action='store_true')
+    group.add_argument('--offloading-n-buffer', type=int, default=None, help='每个 stage 最大能存储的激活块数量')
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',

@@ -105,7 +105,12 @@ def get_forward_backward_func():
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
-            forward_backward_func = forward_backward_pipelining_without_interleaving
+            from megatron.training.global_vars import get_args
+            args = get_args()
+            if args.offloading:
+                forward_backward_func = forward_backward_pipelining_without_interleaving_offloading
+            else:
+                forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = forward_backward_no_pipelining
     return forward_backward_func
@@ -2119,6 +2124,8 @@ def forward_backward_pipelining_without_interleaving_offloading(
                     enable_grad_sync()
 
             transfer_activation_to_target_device(stage_id=rank, microbatch_id=forward_microbatch_id, status="lazypush", is_forward_only=forward_only)
+            if forward_microbatch_id == num_microbatches - 1:
+                transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id+1, status="prefetch", is_forward_only=forward_only)
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
@@ -2192,7 +2199,7 @@ policy_4pp_8mb = [[1,0,0,0,1,0,0,0],
                   [0,0,0,0,0,0,0,0], 
                   [0,0,0,0,0,0,0,0]]
 
-policy_8pp_8mb = [[1,1,1,1,1,1,1,1], 
+policy_8pp_8mb = [[1,1,1,1,0,0,0,0], 
                   [0,0,0,0,0,0,0,0], 
                   [0,0,0,0,0,0,0,0], 
                   [0,0,0,0,0,0,0,0],
@@ -2201,7 +2208,7 @@ policy_8pp_8mb = [[1,1,1,1,1,1,1,1],
                   [0,0,0,0,0,0,0,0],
                   [0,0,0,0,0,0,0,0]]
 
-policy = policy_8pp_8mb
+policy = None
 
 current_device = None
 remote_device = None
@@ -2213,27 +2220,61 @@ storage_init = False
 current_idx = -1
 
 def policy_init():
+    global policy
     global is_policy_init
+    global transfer_stream
+    global remote_device
+    global current_device
+    global remote_device_storage
+    global n_remote_buffer
     if is_policy_init:
         return
     
     from megatron.training.global_vars import get_args
     args = get_args()
-    if policy is not None:
-        global transfer_stream
-        global remote_device
-        global current_device
-        global n_remote_buffer
 
-        current_device = torch.cuda.current_device()
-        remote_device = (len(policy) - parallel_state.get_pipeline_model_parallel_rank() - 1) * parallel_state.get_tensor_model_parallel_world_size() + parallel_state.get_tensor_model_parallel_rank()
-        
-        transfer_stream = torch.cuda.Stream(device=f'cuda:{current_device}')
+    # 根据 n_buffer 的数量来设置 policy 和 n_remote_buffer
 
-        n_remote_buffer = len(policy)
-        is_policy_init = True
+    # just for text
+    if args.pipeline_model_parallel_size == 4:
+        policy = [None for _ in range(4)]
+    elif args.pipeline_model_parallel_size == 8:
+        policy = [None for _ in range(8)]
+    else:
+        raise NotImplementedError(f"Not impletement when {args.pipeline_model_parallel_size=}")
+    
+    stage_id = parallel_state.get_pipeline_model_parallel_rank()
+    n_stage = parallel_state.get_pipeline_model_parallel_world_size()
+    n_microbatch = args.global_batch_size // args.micro_batch_size
+    current_device = torch.cuda.current_device()
+    remote_device = (n_stage - stage_id - 1) * parallel_state.get_tensor_model_parallel_world_size() + parallel_state.get_tensor_model_parallel_rank()
+    transfer_stream = torch.cuda.Stream(device=f'cuda:{current_device}')
 
-        print(f"Policy 参数检查: {current_device=}, {remote_device=}, {parallel_state.get_pipeline_model_parallel_rank()=}, {parallel_state.get_tensor_model_parallel_rank()=}, {args.rank=}")
+    assert args.offloading is True
+    n_buffer = args.offloading_n_buffer
+
+    for i in range(n_stage):
+        if i < n_stage // 2 - 1:
+            n_remote_buffer = n_stage - i - n_buffer
+            policy[i] = (([1 for _ in range(n_remote_buffer)] + [0 for _ in range(n_buffer)]) * 8)[:n_microbatch]
+        else:
+            n_remote_buffer = 0
+            policy[i] = [0 for _ in range(n_microbatch)]
+
+    if stage_id < n_stage // 2 - 1:
+        n_remote_buffer = max(n_stage - stage_id - n_buffer, 0)
+    else:
+        n_remote_buffer = 0
+    # n_remote_buffer = policy[current_device][:args.pipeline_model_parallel_size].count(1)
+    for _ in range(n_remote_buffer):
+        remote_device_storage.append({"occupied": False, "data": [], "microbatch_id": -1})
+    is_policy_init = True
+
+    print(f"Policy 参数检查: {current_device=}, {remote_device=}, {n_remote_buffer=}, \
+                            {parallel_state.get_pipeline_model_parallel_rank()=}, \
+                            {parallel_state.get_tensor_model_parallel_rank()=}, {args.rank=}")
+    if stage_id == 0:
+        print(f"{policy}")
 
 
 # 输入前向传播中产生的激活值 x 和对应的 microbatch_id，返回其在 storage[microbatch_id] 中的索引
@@ -2245,8 +2286,9 @@ def pack_to_storage(x, microbatch_id):
     current_idx += 1
     # 第一个需要 offloading 的前向传播做完即可完成 当前设备 和 远程设备 的空间初始化
     if not storage_init:
-        remote_device_storage.append(torch.empty(tuple(x.shape), dtype=x.dtype, device=f"cuda:{remote_device}"))
         current_device_storage.append(torch.empty(tuple(x.shape), dtype=x.dtype, device=f"cuda:{current_device}"))
+        for idx in range(n_remote_buffer):
+            remote_device_storage[idx]["data"].append(torch.empty(tuple(x.shape), dtype=x.dtype, device=f"cuda:{remote_device}"))
     
     current_device_storage[current_idx].copy_(x.detach(), non_blocking=True)
 
@@ -2279,14 +2321,18 @@ def transfer_activation_to_target_device(stage_id: int, microbatch_id: int, stat
     
     if policy[stage_id][microbatch_id] == 1:
         if status == "lazypush":
-            # return
+            idle_buffer_id = next(idx for idx, buffer in enumerate(remote_device_storage) if not buffer["occupied"])
+            remote_device_storage[idle_buffer_id]["occupied"] = True
+            remote_device_storage[idle_buffer_id]["microbatch_id"] = microbatch_id
             with torch.cuda.stream(transfer_stream):
                 for idx, tensor in enumerate(current_device_storage):
-                    remote_device_storage[idx].copy_(tensor, non_blocking=True)
+                    remote_device_storage[idle_buffer_id]["data"][idx].copy_(tensor, non_blocking=True)
 
         elif status == "prefetch":
+            target_buffer_id = next(idx for idx, buffer in enumerate(remote_device_storage) if buffer["microbatch_id"] == microbatch_id)
+            remote_device_storage[target_buffer_id]["occupied"] = False
             with torch.cuda.stream(transfer_stream):
-                for idx, tensor in enumerate(remote_device_storage):
+                for idx, tensor in enumerate(remote_device_storage[target_buffer_id]["data"]):
                     current_device_storage[idx].copy_(tensor, non_blocking=True)
 
         else:
