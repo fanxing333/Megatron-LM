@@ -2127,6 +2127,25 @@ def forward_backward_pipelining_without_interleaving_offloading(
             if forward_microbatch_id == num_microbatches - 1:
                 transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id+1, status="prefetch", is_forward_only=forward_only)
 
+
+            if is_need_recompute(stage_id=rank, microbatch_id=backward_microbatch_id):
+                output_tensor, _ = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    checkpoint_activations_microbatch,
+                    check_first_val_step(
+                        first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                    ),
+                    current_microbatch=backward_microbatch_id,
+                )
+                deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
@@ -2159,6 +2178,24 @@ def forward_backward_pipelining_without_interleaving_offloading(
             transfer_activation_to_target_device(stage_id=rank, microbatch_id=backward_microbatch_id+1, status="prefetch", is_forward_only=forward_only)
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
+
+            if is_need_recompute(stage_id=rank, microbatch_id=backward_microbatch_id):
+                output_tensor, _ = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    checkpoint_activations_microbatch,
+                    check_first_val_step(
+                        first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                    ),
+                    current_microbatch=backward_microbatch_id,
+                )
+                deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
@@ -2194,14 +2231,14 @@ def forward_backward_pipelining_without_interleaving_offloading(
 # 全局参数
 # offloading 策略
 is_policy_init = False
-policy_4pp_8mb = [[1,0,0,0,1,0,0,0], 
-                  [0,0,0,0,0,0,0,0], 
+policy_4pp_8mb = [[0,2,2,2,0,2,2,2], 
+                  [0,2,2,0,2,2,0,2], 
                   [0,0,0,0,0,0,0,0], 
                   [0,0,0,0,0,0,0,0]]
 
 policy_8pp_8mb = [[1,1,1,1,0,0,0,0], 
-                  [0,0,0,0,0,0,0,0], 
-                  [0,0,0,0,0,0,0,0], 
+                  [1,1,1,0,0,0,0,0], 
+                  [1,1,1,0,0,0,0,0], 
                   [0,0,0,0,0,0,0,0],
                   [0,0,0,0,0,0,0,0],
                   [0,0,0,0,0,0,0,0],
@@ -2237,9 +2274,10 @@ def policy_init():
 
     # just for text
     if args.pipeline_model_parallel_size == 4:
-        policy = [None for _ in range(4)]
+        # policy = [None for _ in range(4)]
+        policy = policy_4pp_8mb
     elif args.pipeline_model_parallel_size == 8:
-        policy = [None for _ in range(8)]
+        policy = policy_8pp_8mb
     else:
         raise NotImplementedError(f"Not impletement when {args.pipeline_model_parallel_size=}")
     
@@ -2253,19 +2291,19 @@ def policy_init():
     assert args.offloading is True
     n_buffer = args.offloading_n_buffer
 
-    for i in range(n_stage):
-        if i < n_stage // 2 - 1:
-            n_remote_buffer = n_stage - i - n_buffer
-            policy[i] = (([1 for _ in range(n_remote_buffer)] + [0 for _ in range(n_buffer)]) * 8)[:n_microbatch]
-        else:
-            n_remote_buffer = 0
-            policy[i] = [0 for _ in range(n_microbatch)]
+    # for i in range(n_stage):
+    #     if i < n_stage // 2 - 1:
+    #         n_remote_buffer = n_stage - i - n_buffer
+    #         policy[i] = (([1 for _ in range(n_remote_buffer)] + [0 for _ in range(n_buffer)]) * 8)[:n_microbatch]
+    #     else:
+    #         n_remote_buffer = 0
+    #         policy[i] = [0 for _ in range(n_microbatch)]
 
-    if stage_id < n_stage // 2 - 1:
-        n_remote_buffer = max(n_stage - stage_id - n_buffer, 0)
-    else:
-        n_remote_buffer = 0
-    # n_remote_buffer = policy[current_device][:args.pipeline_model_parallel_size].count(1)
+    # if stage_id < n_stage // 2 - 1:
+    #     n_remote_buffer = max(n_stage - stage_id - n_buffer, 0)
+    # else:
+    #     n_remote_buffer = 0
+    n_remote_buffer = policy[current_device][:args.pipeline_model_parallel_size].count(1)
     for _ in range(n_remote_buffer):
         remote_device_storage.append({"occupied": False, "data": [], "microbatch_id": -1})
     is_policy_init = True
@@ -2370,3 +2408,16 @@ def get_forward_context(stage_id: int, microbatch_id: int, is_forward_only: bool
     
     else:
         raise NotImplementedError(f"未知的前向传播策略: {forward_op=}")
+    
+
+def is_need_recompute(stage_id: int, microbatch_id: int):
+    global policy
+
+    if len(policy) == 0:
+        return False
+    
+    backward_op = policy[stage_id][microbatch_id]
+    if backward_op == 2:
+        return True
+    else:
+        return False
